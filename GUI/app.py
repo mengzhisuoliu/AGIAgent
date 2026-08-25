@@ -134,6 +134,11 @@ class ConcurrencyManager:
         self.max_concurrent_tasks = max_concurrent_tasks
         self.max_connections = max_connections
         self.task_timeout = task_timeout  # 任务超时时间（Seconds）
+        # 硬超时兜底：任务发出 task_completed 后 finish_task 已将其移出 active_tasks，
+        # 但进程本体可能挂在退出路径（multiprocessing.Queue flush 阻塞、等待用户输入、
+        # 网络调用无超时）而长期不退出，且断连事件可能因僵尸连接永不触发。
+        # 按进程实际创建时间回收，默认 2× task_timeout，可用 AGIA_TASK_HARD_TIMEOUT 覆盖。
+        self.task_hard_timeout = int(os.environ.get('AGIA_TASK_HARD_TIMEOUT', str(task_timeout * 2)))
         self.gui_instance = gui_instance  # Reference to GUI instance for session cleanup
         
         # Concurrency control
@@ -262,10 +267,13 @@ class ConcurrencyManager:
                             for session_id, task_info in self.active_tasks.items():
                                 if current_time - task_info['start_time'] > self.task_timeout:
                                     timeout_sessions.append(session_id)
-                        
+
                         # Handle timeout tasks
                         for session_id in timeout_sessions:
                             self._handle_task_timeout(session_id)
+
+                        # 兜底回收：按进程实际年龄回收 active_tasks 之外的逃逸任务进程
+                        self._reap_stale_task_processes()
                     except Exception as e:
                         pass
                 
@@ -284,6 +292,97 @@ class ConcurrencyManager:
                 
             except Exception as e:
                 time.sleep(10)
+
+    def _kill_process_tree(self, pid):
+        """终止任务进程及其全部子进程(尽力而为)"""
+        try:
+            parent = psutil.Process(pid)
+        except psutil.NoSuchProcess:
+            return
+        try:
+            children = parent.children(recursive=True)
+        except psutil.NoSuchProcess:
+            children = []
+        try:
+            parent.terminate()
+        except psutil.NoSuchProcess:
+            pass
+        _, alive = psutil.wait_procs(children + [parent], timeout=5)
+        for p in alive:
+            try:
+                p.kill()
+            except psutil.NoSuchProcess:
+                pass
+
+    def _reap_stale_task_processes(self):
+        """按进程实际创建时间兜底回收超龄任务进程。
+
+        不依赖 active_tasks 注册表：任务发出 task_completed 后 finish_task 已将其
+        移出 active_tasks 并释放信号量，但进程本体可能挂在退出路径而长期不退出；
+        断连清理也可能因僵尸连接(CLOSE_WAIT)永不触发。此处用 psutil 进程创建
+        时间作为唯一事实来源，覆盖会话引用与孤儿两类逃逸路径。
+        """
+        try:
+            now = time.time()
+            hard_timeout = getattr(self, 'task_hard_timeout', 7200)
+            sessions = getattr(self.gui_instance, 'user_sessions', {}) if self.gui_instance else {}
+            referenced_pids = set()
+
+            # 1) 会话仍引用的进程：超龄 → 强制回收并释放对应槽位
+            for sid, user_session in list(sessions.items()):
+                proc = getattr(user_session, 'current_process', None)
+                if not proc or not getattr(proc, 'pid', None):
+                    continue
+                if not proc.is_alive():
+                    user_session.current_process = None
+                    continue
+                referenced_pids.add(proc.pid)
+                try:
+                    age = now - psutil.Process(proc.pid).create_time()
+                except psutil.NoSuchProcess:
+                    continue
+                if age > hard_timeout:
+                    print(f"[{datetime.datetime.now().isoformat()}] ⏱️ Hard-timeout task process pid={proc.pid} (age={int(age)}s > {hard_timeout}s), session={sid}")
+                    self._kill_process_tree(proc.pid)
+                    try:
+                        proc.join(timeout=2)
+                    except Exception:
+                        pass
+                    user_session.current_process = None
+                    user_session.output_queue = None  # 让残留的 queue_reader 线程自然退出
+                    with self.lock:
+                        if sid in self.active_tasks:
+                            self.active_tasks.pop(sid, None)
+                            self.task_semaphore.release()
+
+            # 2) 孤儿兜底：master 直接子进程中 argv 含 app.py、不被任何会话引用的超龄进程
+            #    （terminal shell 等其他子进程 cmdline 不含 app.py，不受影响）
+            try:
+                me = psutil.Process()
+                for child in me.children(recursive=False):
+                    if child.pid in referenced_pids:
+                        continue
+                    try:
+                        if 'app.py' not in ' '.join(child.cmdline()):
+                            continue
+                        age = now - child.create_time()
+                        if age > hard_timeout:
+                            print(f"[{datetime.datetime.now().isoformat()}] ⏱️ Reaping orphan task process pid={child.pid} (age={int(age)}s)")
+                            self._kill_process_tree(child.pid)
+                    except psutil.NoSuchProcess:
+                        continue
+            except Exception:
+                pass
+
+            # 3) active_tasks 中会话已不存在的陈旧条目：归还信号量槽位
+            with self.lock:
+                stale_sids = [sid for sid, info in self.active_tasks.items()
+                              if now - info['start_time'] > hard_timeout and sid not in sessions]
+                for sid in stale_sids:
+                    self.active_tasks.pop(sid, None)
+                    self.task_semaphore.release()
+        except Exception as e:
+            print(f"[{datetime.datetime.now().isoformat()}] ⚠️ _reap_stale_task_processes error: {e}")
     
     def _cleanup_idle_sessions_for_gui(self):
         """Clean up idle sessions - integrated from GUI class"""
